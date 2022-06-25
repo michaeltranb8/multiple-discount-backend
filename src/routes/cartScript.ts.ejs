@@ -1,0 +1,726 @@
+interface Window {
+  Shopify: any
+  ShopifyAnalytics: any
+  B8_CUSTOMER_ID: any
+  B8_CUSTOMER_TAGS: any
+}
+
+abstract class ThemeAdapter {
+  abstract get isCartPage(): boolean
+
+  get isProductDetailPage() {
+    return window.ShopifyAnalytics.meta.page.pageType === 'product'
+  }
+
+  abstract updateCartPage(): Promise<void>
+
+  abstract updateProductDetailPage(): Promise<void>
+}
+
+async function getCart() {
+  const response = await fetch('/cart.json')
+  const fullCart = await response.json()
+  const shop = window.Shopify.shop
+  const cart = {
+    token: fullCart.token,
+    items: fullCart.items.map(item => ({
+      product_id: item.product_id,
+      variant_id: item.variant_id,
+      quantity: item.quantity
+    }))
+  }
+  const customer = { id: window.B8_CUSTOMER_ID, tags: window.B8_CUSTOMER_TAGS }
+  return { shop, cart, customer }
+}
+
+async function get(url: string) {
+  const response = await fetch(url, {
+    method: 'get',
+    headers: {
+      'content-type': 'application/json'
+    },
+    mode: 'cors'
+  })
+  return await response.json()
+}
+
+async function post(url: string, body: object) {
+  const response = await fetch(url, {
+    method: 'POST',
+    body: JSON.stringify(body),
+    headers: {
+      'content-type': 'application/json'
+    },
+    mode: 'cors'
+  })
+  return await response.json()
+}
+
+async function createDiscounts({ shop, cart, customer, discountCode }) {
+  return await post('<%= process.env.PROMO_API_HOST %>/client/discounts', {
+    shop,
+    cart,
+    customer,
+    discountCode
+  })
+}
+
+async function createProductDiscount(
+  productVariantId,
+  { shop, cart, customer }
+) {
+  return await post(
+    `<%= process.env.PROMO_API_HOST %>/client/product_discounts/${productVariantId}`,
+    { shop, cart, customer }
+  )
+}
+
+async function createProductDiscounts(
+  productVariantIds,
+  { shop, cart, customer }
+) {
+  return await post(
+    `<%= process.env.PROMO_API_HOST %>/client/product_discounts`,
+    { productVariantIds, shop, cart, customer }
+  )
+}
+
+async function createDraft({ shop, cart, customer, discountCode }) {
+  return await post('<%= process.env.PROMO_API_HOST %>/client/drafts', {
+    shop,
+    cart,
+    customer,
+    discountCode
+  })
+}
+
+async function getVariant({ shop, id }) {
+  return await get(
+    `<%= process.env.PROMO_API_HOST %>/client/variants/${id}?shop=${shop}`
+  )
+}
+
+function qs(selector) {
+  return document.querySelector(selector)
+}
+
+function queryWithCheck(selector, callback) {
+  const node = document.querySelector(selector)
+  if (!node) {
+    console.warn(
+      `[Multiple Discounts]: cannot find element with selector: ${selector}`
+    )
+  } else {
+    callback(node)
+    return node
+  }
+}
+
+function queryAllWithCheck(selector, callback) {
+  const nodeList = document.querySelectorAll(selector)
+  if (nodeList.length === 0) {
+    console.warn(
+      `[Multiple Discounts]: cannot find element with selector: ${selector}`
+    )
+  } else {
+    nodeList.forEach(callback)
+    return nodeList
+  }
+}
+
+function toDecimal(value) {
+  return '$' + parseFloat(value).toFixed(2)
+}
+
+class Debut extends ThemeAdapter {
+  get isCartPage() {
+    return qs('form.cart') != null
+  }
+
+  async updateCartPage() {
+
+    await installLiquid()
+    const cart = await getCart()
+    const discount = await createDiscounts(cart)
+
+    for (const lineItem of discount.lineItems) {
+      const { variantId, appliedRules, total, originalPrice } = lineItem
+      if (appliedRules.length > 0) {
+        const priceParent = qs(
+          `[data-cart-item-key^="${variantId}"] [data-cart-item-line-price]`
+        )
+        const price = priceParent.querySelector(
+          '[data-cart-item-regular-price-group]'
+        )
+        price.innerHTML = `<div>${toDecimal(total)}</div>`
+        price.innerHTML += `<div><del>${toDecimal(originalPrice)}</del></div>`
+
+        for (const appliedRule of appliedRules) {
+          priceParent.innerHTML += `<div>-${toDecimal(appliedRule.discount)} (${
+            appliedRule.name
+          })</div>`
+        }
+      }
+    }
+    const subtotal = qs('[data-cart-subtotal]')
+    subtotal.textContent = toDecimal(discount.subtotal)
+
+    let DEFAULT_DISCOUNTS_TEMPLATE = `
+    <div style="color:red">
+      {% for rule in appliedRules %}
+        <div>-{{ rule.discount }} ({{ rule.name }})</div>
+      {% endfor %}
+      </div>
+      <div>${toDecimal(discount.subtotal)}</div>
+    `
+    queryWithCheck('[class="cart-subtotal"]', async discounts => {
+      const reducedItemDiscounts = {}
+      for (const lineItem of discount.lineItems) {
+        for (const appliedRule of lineItem.appliedRules) {
+          reducedItemDiscounts[appliedRule.name] =
+            (reducedItemDiscounts[appliedRule.name] || 0) +
+            parseFloat(appliedRule.discount)
+        }
+      }
+      for (const appliedRule of discount.appliedRules) {
+        reducedItemDiscounts[appliedRule.name] =
+          (reducedItemDiscounts[appliedRule.name] || 0) +
+          parseFloat(appliedRule.discount)
+      }
+
+      const data = {
+        appliedRules: Object.entries(reducedItemDiscounts).map(entry => ({
+          name: entry[0],
+          discount: toDecimal(entry[1])
+        }))
+      }
+      
+      const total = qs('[class="cart-subtotal__price"]')
+      total.innerHTML = await compileTemplate({
+        selector: '[data-md-discounts-template]',
+        defaultTemplate: DEFAULT_DISCOUNTS_TEMPLATE,
+        data
+      })
+    })
+
+
+    if (discount.shippingLine) {
+      qs('.cart__shipping').innerHTML =
+        'Free shipping<br />Taxes calculated at checkout'
+    }
+
+    qs('form.cart').addEventListener('submit', async e => {
+      e.preventDefault()
+      const checkoutButton = qs('[name="checkout"]')
+      checkoutButton.disabled = true
+
+      const draftOrder = await createDraft(cart)
+      window.location.href = draftOrder.draft_order.invoice_url
+    })
+  }
+
+  async updateProductDetailPage() {
+    const productVariantId = window.ShopifyAnalytics.meta.selectedVariantId
+    const cart = await getCart()
+    const discount = await createProductDiscount(productVariantId, cart)
+
+    if (discount.price !== discount.finalPrice) {
+      qs(
+        '[data-regular-price]'
+      ).innerHTML = `<del>$${discount.price}</del> $${discount.finalPrice} (-$${discount.discount})`
+    }
+  }
+}
+
+async function installLiquid() {
+  if ('liquidjs' in window && engine instanceof liquidjs.Liquid) {
+    return
+  }
+
+  if ('liquidjs' in window) {
+    engine = new liquidjs.Liquid()
+    return
+  }
+
+  return new Promise<void>((resolve, reject) => {
+    var s = document.createElement('script')
+    s.setAttribute(
+      'src',
+      'https://cdn.jsdelivr.net/npm/liquidjs/dist/liquid.browser.min.js'
+    )
+    s.onload = () => {
+      engine = new liquidjs.Liquid()
+      resolve()
+    }
+    s.onerror = () => {
+      console.error('[Multiple Discounts]: unable load liquidjs from cdn.')
+      reject()
+    }
+    document.body.appendChild(s)
+  })
+}
+
+let engine // share engine
+
+async function compileTemplate({ selector, defaultTemplate, data }) {
+  const node = document.querySelector(selector)
+  if (!node) {
+    console.warn(
+      `[Multiple Discounts]: cannot find template with selector: ${selector}, will use the default template.`
+    )
+  }
+  const template = node ? node.innerHTML : defaultTemplate
+  try {
+    return await engine.parseAndRender(template, data)
+  } catch (error) {
+    console.error(
+      `[Multiple Discounts]: compiling template '${selector}' with error: ${error}, will use the default template.`
+    )
+    return await engine.parseAndRender(defaultTemplate, data)
+  }
+}
+
+function loadDiscountCode() {
+  try {
+    return JSON.parse(localStorage.getItem('discountCode')) || []
+  } catch (error) {
+    return []
+  }
+}
+
+function storeDiscountCode(discountCode: string[]) {
+  return localStorage.setItem('discountCode', JSON.stringify(discountCode))
+}
+
+const DEFAULT_LOADING_TEMPLATE = `
+  <style>
+    @keyframes rotating {
+      from {
+        transform: rotate(0deg);
+      }
+      to {
+        transform: rotate(360deg);
+      }
+    }
+  </style>
+  <svg width="24" height="24" style="animation: rotating 1s linear infinite;">
+    <circle class="donut-segment" cx="12" cy="12" r="10"
+            fill="transparent" stroke="#999999"
+            stroke-width="3" stroke-dasharray="50" stroke-dashoffset="0"></circle>
+  </svg>
+`
+
+const DEFAULT_DISCOUNTS_TEMPLATE = `
+  {% for rule in appliedRules %}
+    <div>-{{ rule.discount }} ({{ rule.name }})</div>
+  {% endfor %}
+`
+
+const DEFAULT_DISCOUNTS_TEMPLATE_FIXEDSTYLE = `
+{% if appliedRules.size > 0 %}
+<style>
+  #boxDiscountSummary{
+    position: fixed;
+    bottom: 0;
+    background-color: white;
+    left: 20px;
+    padding: 10px;
+    border: 1px solid #a7b7c5;
+    border-bottom: none;
+  }
+  #boxDiscountSummary .quantity-deals{
+    position: absolute;
+    top: -10px;
+    right:-8px;
+    border-radius: 50%;
+    background: red;
+    width: 20px;
+    height: 20px;
+    font-size: 12px;
+    text-align: center;
+    color: white;
+  }
+  #boxDiscountSummary:hover  .md-content {
+    display: block;
+    margin: 5px 0;
+  }
+  .md-content{display:none}
+</style>
+  <div class="md-header">
+  <span style="font-weight: bold">Your Deals</span>
+  <span class="quantity-deals">{{ appliedRules.size }}</span>
+  </div>
+  <div class="md-content">
+    {% for rule in appliedRules %}
+      <div>🎉  -{{ rule.discount }} ({{ rule.name }})</div>
+    {% endfor %}
+    <span>Automatically applied at checkout.</span>
+  </div>
+{% endif %}
+`
+const DEFAULT_CART_ITEM_PRICE_TEMPLATE = `
+  <div>
+    <div>{{ total }}</div>
+    {% if hasDiscount %}
+      <div><del>{{ originalPrice }}</del></div>
+      {% for rule in appliedRules %}
+        <div>-{{ rule.discount }} ({{ rule.name }})</div>
+      {% endfor %}
+    {% endif %}
+  </div>
+`
+
+const DEFAULT_CART_ITEM_TEMPLATE = `
+  <tr>
+    <td><img src='{{ product.image.src }}' style='width: 4em' /></td>
+    <td>{{ product.title }} ({{ variant.title }})</td>
+    <td>{{ variant.price }}</td>
+    <td class="md-offer-total">{{ offer.total }}</td>
+    <td>
+      <button type='button' data-md-add-to-cart='{{ variant.id }}'>Add to cart</button>
+    </td>
+  </tr>
+`
+const DEFAULT_PRODUCT_PRICE_TEMPLATE = `
+  {% if price != finalPrice %}
+  	<div style="border: 3px dotted red">
+      <del>{{ price }}</del> {{ finalPrice }} (-{{ discount }})
+    </div>
+  {% else %}
+    {{ price }}
+  {% endif %}
+`
+
+const DEFAULT_CART_SUBTOTAL_TEMPLATE = `
+  {% for rule in appliedRules %}
+    <div>-{{ rule.discount }} ({{ rule.name }})</div>
+  {% endfor %}
+  <del>{{ originalSubtotal }}</del> {{ subtotal }} (-{{ sumOfDiscounts }})
+`
+
+const DEFAULT_SHIPPING_TEMPLATE = `
+  {% if isFreeShipping %}
+    Free shipping<br />
+  {% endif %}
+  Taxes calculated at checkout
+`
+
+async function renderLoading(element) {
+  element.innerHTML = await compileTemplate({
+    selector: '[data-md-loading-template]',
+    defaultTemplate: DEFAULT_LOADING_TEMPLATE,
+    data: {}
+  })
+}
+
+class Custom extends ThemeAdapter {
+  get isCartPage() {
+    return qs('[data-md-cart-page]') != null
+  }
+
+  get isProductDetailPage() {
+    return qs('[data-md-product-detail-page]') != null
+  }
+
+  async updateCartPage() {
+    await installLiquid()
+
+    queryAllWithCheck(`[data-md-cart-item-price]`, renderLoading)
+    queryAllWithCheck(`[data-md-cart-subtotal]`, renderLoading)
+    queryAllWithCheck(`[data-md-shipping]`, renderLoading)
+    queryWithCheck('[name="checkout"]', button => (button.disabled = true))
+
+    const discountCode = loadDiscountCode()
+
+    const cart = await getCart()
+    const discount = await createDiscounts({ ...cart, discountCode })
+
+    for (const lineItem of discount.lineItems) {
+      const { variantId, appliedRules, total, originalPrice } = lineItem
+      queryAllWithCheck(
+        `[data-md-cart-item-price^="${variantId}"]`,
+        async price => {
+          const data = {
+            hasDiscount: appliedRules.length > 0,
+            originalPrice: toDecimal(originalPrice),
+            total: toDecimal(total),
+            totalDiscount: toDecimal(originalPrice - total),
+            appliedRules: appliedRules.map(rule => ({
+              name: rule.name,
+              discount: toDecimal(rule.discount)
+            }))
+          }
+          console.log('data', data);
+          price.innerHTML = await compileTemplate({
+            selector: '[data-md-cart-item-price-template]',
+            defaultTemplate: DEFAULT_CART_ITEM_PRICE_TEMPLATE,
+            data
+          })
+        }
+      )
+      queryAllWithCheck(
+        `[data-md-cart-item-discounts^="${variantId}"]`,
+        async discounts => {
+          const data = {
+            appliedRules: appliedRules.map(rule => ({
+              name: rule.name,
+              discount: toDecimal(rule.discount)
+            }))
+          }
+          discounts.innerHTML = await compileTemplate({
+            selector: '[data-md-discounts-template]',
+            defaultTemplate: DEFAULT_DISCOUNTS_TEMPLATE,
+            data
+          })
+        }
+      )
+    }
+ 
+    // check data-md-cart-possible-offer-item exists
+    const cartPossibleOfferSection = document.querySelector('[data-md-cart-possible-offer-item]')
+
+    if (!cartPossibleOfferSection) {
+      let container = document.createElement("div");
+      let table = document.createElement("table");
+      let boxPossibleOfferItems = document.createElement("tbody");
+      container.innerHTML = `<h1>Possible Offer</h1><style>.md-offer-total{display:none}</style>`;
+      boxPossibleOfferItems.setAttribute("data-md-cart-possible-offer-items", "");
+      table.appendChild(boxPossibleOfferItems);
+      container.appendChild(table);
+      document.querySelector(".cart__footer").after(container);
+    }
+    queryWithCheck(
+      '[data-md-cart-possible-offer-items]',
+      async possibleItems => {
+        for (const offer of discount.possibleOffers.filter(
+          offer => !offer.isFree
+        )) {
+          const { variant, product } = await getVariant({
+            shop: cart.shop,
+            id: offer.variantId
+          })
+          const data = { variant, product, offer }
+          possibleItems.innerHTML += await compileTemplate({
+            selector: '[data-md-cart-item-template]',
+            defaultTemplate: DEFAULT_CART_ITEM_TEMPLATE,
+            data
+          })
+        }
+      }
+    )
+   // check data-md-cart-free-items exists
+    const cartFreeSection = document.querySelector('[data-md-cart-free-items]')
+
+    if (!cartFreeSection) {
+      let container = document.createElement("div");
+      let table = document.createElement("table");
+      let boxCartFreeItems = document.createElement("tbody");
+      container.innerHTML = `<h1>Free Products</h1><style>.md-offer-total{display:none}</style>`;
+      boxCartFreeItems.setAttribute("data-md-cart-free-items", "");
+      table.appendChild(boxCartFreeItems);
+      container.appendChild(table);
+      document.querySelector(".cart__footer").after(container);
+    }
+    queryWithCheck('[data-md-cart-free-items]', async freeItems => {
+      for (const offer of discount.possibleOffers.filter(
+        offer => offer.isFree
+      )) {
+        const { variant, product } = await getVariant({
+          shop: cart.shop,
+          id: offer.variantId
+        })
+        const data = { variant, product, offer }
+        freeItems.innerHTML += await compileTemplate({
+          selector: '[data-md-cart-item-template]',
+          defaultTemplate: DEFAULT_CART_ITEM_TEMPLATE,
+          data
+        })
+      }
+    })
+    queryAllWithCheck('[data-md-cart-subtotal]', async subtotal => {
+      const data = {
+        originalSubtotal: toDecimal(discount.originalSubtotal),
+        sumOfDiscounts: toDecimal(discount.sumOfDiscounts),
+        subtotal: toDecimal(discount.subtotal),
+        appliedRules: discount.appliedRules.map(appliedRule => ({
+          name: appliedRule.name,
+          discount: toDecimal(appliedRule.discount)
+        }))
+      }
+      subtotal.innerHTML = await compileTemplate({
+        selector: '[data-md-cart-subtotal-template]',
+        defaultTemplate: DEFAULT_CART_SUBTOTAL_TEMPLATE,
+        data
+      })
+    })
+    queryAllWithCheck('[data-md-cart-discounts]', async discounts => {
+      const data = {
+        appliedRules: discount.appliedRules.map(appliedRule => ({
+          name: appliedRule.name,
+          discount: toDecimal(appliedRule.discount)
+        }))
+      }
+      discounts.innerHTML = await compileTemplate({
+        selector: '[data-md-discounts-template]',
+        defaultTemplate: DEFAULT_DISCOUNTS_TEMPLATE,
+        data
+      })
+    })
+
+    const renderDiscountSummary = async (discounts,defaultTemplate) => {
+      const reducedItemDiscounts = {}
+      for (const lineItem of discount.lineItems) {
+        for (const appliedRule of lineItem.appliedRules) {
+          reducedItemDiscounts[appliedRule.name] =
+            (reducedItemDiscounts[appliedRule.name] || 0) +
+            parseFloat(appliedRule.discount)
+        }
+      }
+      for (const appliedRule of discount.appliedRules) {
+        reducedItemDiscounts[appliedRule.name] =
+          (reducedItemDiscounts[appliedRule.name] || 0) +
+          parseFloat(appliedRule.discount)
+      }
+
+      const data = {
+        appliedRules: Object.entries(reducedItemDiscounts).map(entry => ({
+          name: entry[0],
+          discount: toDecimal(entry[1])
+        }))
+      }
+      discounts.innerHTML = await compileTemplate({
+        selector: '[data-md-discounts-template]',
+        defaultTemplate: defaultTemplate,
+        data
+      })
+    }
+    const discountSummarySection = document.querySelector('[data-md-discount-summary]')
+
+    if (!discountSummarySection) {
+      const boxDS = document.createElement("div");
+      boxDS.setAttribute("id", "boxDiscountSummary");
+      document.querySelector("footer").before(boxDS);
+      queryAllWithCheck('#boxDiscountSummary',discounts => renderDiscountSummary(discounts,DEFAULT_DISCOUNTS_TEMPLATE_FIXEDSTYLE))
+    }
+
+    queryAllWithCheck('[data-md-discount-summary]',discounts => renderDiscountSummary(discounts,DEFAULT_DISCOUNTS_TEMPLATE))
+
+    queryAllWithCheck('[data-md-shipping]', async shipping => {
+      const data = {
+        isFreeShipping: !!discount.shippingLine
+      }
+      shipping.innerHTML = await compileTemplate({
+        selector: '[data-md-shipping-template]',
+        defaultTemplate: DEFAULT_SHIPPING_TEMPLATE,
+        data
+      })
+    })
+
+    queryWithCheck('[name="checkout"]', button => (button.disabled = false))
+
+    if (this.isUpdated) {
+      return
+    }
+
+    document.addEventListener('click', event => {
+      if (event.target instanceof HTMLElement) {
+        const button = event.target
+        const id = event.target.dataset.mdAddToCart
+        if (!id) {
+          return
+        }
+        const form = document.createElement('form')
+        form.method = 'post'
+        form.action = '/cart/add'
+        form.innerHTML = `<input name='id' value='${id}' type='hidden' />`
+        form.style.display = 'none'
+        document.body.appendChild(form)
+        form.submit()
+      }
+    })
+
+    document.addEventListener('submit', async e => {
+      if (e.target instanceof HTMLFormElement) {
+        if (!('mdCartForm' in e.target.dataset)) {
+          // not [data-md-cart-form]
+          return
+        }
+        e.preventDefault()
+      }
+      this.isUpdated = true
+    })
+    const checkoutButton = document.querySelector('button[type="submit"][name="checkout"], input[type="submit"][name="checkout"]')
+
+    if (checkoutButton) {
+      checkoutButton.addEventListener('click', async (event) => {
+        this.isUpdated = true
+        event.target.disabled = true
+        const discountCode = loadDiscountCode()
+        const draftOrder = await createDraft({ ...cart, discountCode })
+        window.location.href = draftOrder.draft_order.invoice_url
+      })
+    }
+    
+
+    const applyDiscountCodeButton = document.querySelector('button[name="applyDiscountCode"], input[type="submit"][name="applyDiscountCode"]')
+    if (applyDiscountCodeButton) {
+      applyDiscountCodeButton.addEventListener('click', (event) => {
+        this.isUpdated = true
+        queryWithCheck('[data-md-discount-code]', input => {
+          const discountCode = loadDiscountCode()
+          storeDiscountCode([...discountCode, input.value].slice(-3))
+          this.updateCartPage()
+        })
+      })
+    }
+  }
+
+  isUpdated = false
+
+  async updateProductDetailPage() {
+    await installLiquid()
+
+    queryAllWithCheck(`[data-md-product-price]`, renderLoading)
+
+    const productVariantId = window.ShopifyAnalytics.meta.selectedVariantId
+    const cart = await getCart()
+    const discount = await createProductDiscount(productVariantId, cart)
+
+    queryAllWithCheck('[data-md-product-price]', async price => {
+      const data = {
+        price: toDecimal(discount.price),
+        finalPrice: toDecimal(discount.finalPrice),
+        discount: toDecimal(discount.discount)
+      }
+      price.innerHTML = await compileTemplate({
+        selector: '[data-md-product-price-template]',
+        defaultTemplate: DEFAULT_PRODUCT_PRICE_TEMPLATE,
+        data
+      })
+    })
+  }
+}
+
+function getThemeAdapter(): ThemeAdapter {
+  switch (window.Shopify.theme.name) {
+    case 'Debut':
+      return new Debut()
+    default:
+      return new Custom()
+  }
+}
+
+const themeAdapter = getThemeAdapter()
+
+if (!themeAdapter) {
+  console.error(
+    `The theme "${window.Shopify.theme.name}" was not supported yet`
+  )
+} else {
+  if (themeAdapter.isCartPage) {
+    themeAdapter.updateCartPage()
+  }
+  if (themeAdapter.isProductDetailPage) {
+    themeAdapter.updateProductDetailPage()
+  }
+}
